@@ -6,13 +6,15 @@ import pytz
 import os
 from openai import OpenAI
 
-# Configure client to use AI Pipe
+# 1. Initialize FastAPI app first
+app = FastAPI()
+
+# 2. Configure OpenAI client to use AI Pipe
 client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openai/v1"
 )
 
-# Your specific API export URL from the root JSON response
 EXPORT_URL = "https://exam.sanand.workers.dev/questionData?email=24f3003188%40ds.study.iitm.ac.in&quizSign=0eyEF2vP3oDh3px4Vo9tHq71IUREcIBMw1EaaKOnFW%2B1UjL9P9wdpb%2BeSpssg%2BTBBUrwhwiNQq6eP7rfINIEW02t%2BV2%2B6VRmhVnmIR1bUNbnmebNkceN9GqbctO9qMtZM34SaH835zl934rGiZU2buVnN4k0ukAhSOgidNU937swfeIxT4C7DGTXSlKOixvebm%2BogWfa428bTAnEjTWD0Anq74Swn8jsnnq3qaNQm4tKka%2BfUxh8M3iq5kS4h%2FX1A3ONm1qNCal6lJxKAP%2FuTWM94UXVF8n9GHUdQ72GmNL5jBEudtFnRyFiECqe5%2B%2FopPut9MsHAywOHqoxDwCwgQ%3D%3D&questionId=q-ledger-agent-server&path=%2Fexport"
 
 class QuestionRequest(BaseModel):
@@ -32,7 +34,6 @@ def get_cleaned_data():
         df = df.sort_values("updated_at").drop_duplicates(subset=["order_id"], keep="last")
 
     # Rule: Business dates use Asia/Kolkata timezone
-    kolkata_tz = pytz.timezone("Asia/Kolkata")
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
 
@@ -42,7 +43,6 @@ def get_cleaned_data():
 def answer_question(req: QuestionRequest):
     df = get_cleaned_data()
     
-    # Pass data summary to LLM to compute the answer
     prompt = f"""
     You are a financial data assistant for Acme Appliances.
     Here is the cleaned ledger data (as JSON records):
@@ -66,7 +66,6 @@ def answer_question(req: QuestionRequest):
     
     ans = response.choices[0].message.content.strip()
 
-    # Format numeric output correctly
     try:
         if "." in ans:
             return {"answer": float(ans)}
