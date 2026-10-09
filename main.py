@@ -1,102 +1,101 @@
-from fastapi import FastAPI, HTTPException
+import os, json, requests, pandas as pd, numpy as np
+from fastapi import FastAPI
 from pydantic import BaseModel
-import requests
-import pandas as pd
-import pytz
-import os
-import io
 from openai import OpenAI
 
+ROOT = "PASTE_ROOT_URL"     # the URL ending in path=/
+TZ = "Asia/Kolkata"
+
 app = FastAPI()
+client = OpenAI(api_key=os.environ["AIPIPE_TOKEN"],
+                base_url="https://aipipe.org/openai/v1")
 
-client = OpenAI(
-    api_key=os.environ.get("AIPIPE_TOKEN"),
-    base_url="https://aipipe.org/openai/v1"
-)
-
-# Your specific links
-EXPORT_URL = "https://exam.sanand.workers.dev/questionData?email=24f3003188%40ds.study.iitm.ac.in&quizSign=0eyEF2vP3oDh3px4Vo9tHq71IUREcIBMw1EaaKOnFW%2B1UjL9P9wdpb%2BeSpssg%2BTBBUrwhwiNQq6eP7rfINIEW02t%2BV2%2B6VRmhVnmIR1bUNbnmebNkceN9GqbctO9qMtZM34SaH835zl934rGiZU2buVnN4k0ukAhSOgidNU937swfeIxT4C7DGTXSlKOixvebm%2BogWfa428bTAnEjTWD0Anq74Swn8jsnnq3qaNQm4tKka%2BfUxh8M3iq5kS4h%2FX1A3ONm1qNCal6lJxKAP%2FuTWM94UXVF8n9GHUdQ72GmNL5jBEudtFnRyFiECqe5%2B%2FopPut9MsHAywOHqoxDwCwgQ%3D%3D&questionId=q-ledger-agent-server&path=%2Fexport"
-RATES_URL = "https://exam.sanand.workers.dev/questionData?email=24f3003188%40ds.study.iitm.ac.in&quizSign=0eyEF2vP3oDh3px4Vo9tHq71IUREcIBMw1EaaKOnFW%2B1UjL9P9wdpb%2BeSpssg%2BTBBUrwhwiNQq6eP7rfINIEW02t%2BV2%2B6VRmhVnmIR1bUNbnmebNkceN9GqbctO9qMtZM34SaH835zl934rGiZU2buVnN4k0ukAhSOgidNU937swfeIxT4C7DGTXSlKOixvebm%2BogWfa428bTAnEjTWD0Anq74Swn8jsnnq3qaNQm4tKka%2BfUxh8M3iq5kS4h%2FX1A3ONm1qNCal6lJxKAP%2FuTWM94UXVF8n9GHUdQ72GmNL5jBEudtFnRyFiECqe5%2B%2FopPut9MsHAywOHqoxDwCwgQ%3D%3D&questionId=q-ledger-agent-server&path=%2Frates"
-
-class QuestionRequest(BaseModel):
+class Q(BaseModel):
     question: str
 
-# Cache the data so we don't redownload it for every single question
-_data_cache = None
-_rates_cache = None
+def load():
+    links = requests.get(ROOT, timeout=20).json()["links"]
+    rates = requests.get(links["rates"], timeout=20).json()["usd_per_unit"]
+    text = requests.get(links["export"], timeout=30).text
+    df = pd.DataFrame([json.loads(l) for l in text.splitlines() if l.strip()])
 
-def get_data():
-    global _data_cache, _rates_cache
-    if _data_cache is not None:
-        return _data_cache, _rates_cache
+    # 1. keep only the newest version of each order id
+    df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, format="ISO8601")
+    df = df.sort_values("updated_at").drop_duplicates("id", keep="last")
 
-    try:
-        # Fetch rates
-        _rates_cache = requests.get(RATES_URL).json()
+    # 2. tidy status text
+    df["status"] = df["status"].astype(str).str.strip().str.lower()
 
-        # Fetch export and parse JSONL (JSON Lines)
-        res = requests.get(EXPORT_URL)
-        df = pd.read_json(io.StringIO(res.text), lines=True)
+    # 3. business dates in Kolkata time
+    ts = pd.to_datetime(df["created_at"], utc=True, format="ISO8601").dt.tz_convert(TZ)
+    df["month"] = ts.dt.strftime("%Y-%m")        # e.g. 2026-04
+    df["date"] = ts.dt.strftime("%Y-%m-%d")
 
-        # Rule: Deduplicate based on 'id' keeping the latest 'updated_at'
-        df["updated_at"] = pd.to_datetime(df["updated_at"])
-        df = df.sort_values("updated_at").drop_duplicates(subset=["id"], keep="last")
-        
-        # Ensure created_at is a datetime object in Kolkata timezone
-        df["created_at"] = pd.to_datetime(df["created_at"])
+    # 4. money in USD: multiply by "USD per unit"
+    df["usd"] = df["amount"].astype(float) * df["currency"].map(rates).astype(float)
 
-        _data_cache = df
-        return _data_cache, _rates_cache
-    except Exception as e:
-        print(f"Data fetch error: {e}")
-        return pd.DataFrame(), {}
+    df = df.drop(columns=["created_at", "updated_at"])
+    return df.reset_index(drop=True), rates
+
+DF, RATES = load()      # once, at startup
+
+PROMPT = """You write pandas code. A DataFrame `df` already exists.
+Columns: {cols}
+Sample rows: {sample}
+Statuses in the data: {statuses}
+
+Rules:
+- `usd` is the order amount already converted to USD. Use it for ALL money. Never convert again.
+- `month` is like '2026-04' and `date` like '2026-04-15' (already in the business timezone). Filter dates with these columns only.
+- Revenue = sum of `usd` where status == 'paid'. Units sold = sum of `qty` where status == 'paid'.
+- Refunds = rows where status == 'refunded'. Refund amount = sum of `usd` for those rows. 'void' rows count for nothing.
+- "Top-selling by revenue" = groupby('product')['usd'].sum() then idxmax(). "By units" = use `qty` instead.
+- Customers: count with df['customer'].nunique() on the right filtered rows.
+- Region values and product names must be matched exactly as in the data; return product names exactly as written.
+- Put the final answer in a variable named `result` (a plain number or string). Do not round, do not print.
+- Output ONLY raw Python code, no markdown.
+
+Examples:
+Q: Total revenue in USD from the North region in March 2026?
+result = df[(df.status=='paid') & (df.region=='North') & (df.month=='2026-03')].usd.sum()
+Q: Which product had the most revenue in April 2026?
+result = df[(df.status=='paid') & (df.month=='2026-04')].groupby('product').usd.sum().idxmax()
+
+Question: {q}"""
+
+def to_json_safe(x):
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[0, 0]
+    if isinstance(x, (pd.Series, pd.Index)):
+        x = x.iloc[0] if len(x) == 1 else x.tolist()
+    if isinstance(x, np.generic):
+        x = x.item()
+    if isinstance(x, float):
+        x = round(x, 2)
+    return x
+
+def run_code(code):
+    code = code.replace("```python", "").replace("```", "").strip()
+    ns = {"df": DF.copy(), "rates": RATES, "pd": pd, "np": np}
+    exec(code, ns)                         # ONE dictionary
+    return to_json_safe(ns["result"])
 
 @app.post("/")
-def answer_question(req: QuestionRequest):
-    df, rates = get_data()
-    if df.empty:
-        raise HTTPException(status_code=500, detail="Failed to load ledger data.")
-
-    # We ask the AI to generate a Pandas command that computes the answer
-    prompt = f"""
-    You are a data analyst. I have a Pandas DataFrame `df`.
-    Columns: {list(df.columns)}
-    Sample row: {df.iloc[0].to_dict()}
-    
-    Currency Exchange Rates `rates`: {rates}
-
-    Rules:
-    - Only orders with status 'paid' count as revenue/valid unless asking about refunds.
-    - Money must be answered in USD. You MUST use the `rates` dictionary to convert the `amount` column from the local `currency` to USD.
-    - Count unique customers using `nunique()`.
-
-    Question: "{req.question}"
-
-    Write ONLY valid Python code using pandas that computes the answer and assigns it to a variable named `result`.
-    Do not use markdown backticks (no ```python). Just the raw python code.
-    Example output format:
-    result = df[(df['status'] == 'paid') & (df['product'] == 'Rice Cooker')]['customer'].nunique()
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        
-        # Clean up the AI's output in case it includes markdown
-        code = response.choices[0].message.content.strip().replace("```python", "").replace("```", "")
-        
-        # Execute the AI's code safely in memory
-        local_vars = {"df": df, "rates": rates, "pd": pd}
-        exec(code, {}, local_vars)
-        ans = local_vars.get("result")
-
-        # Format numeric output (correct to the cent)
-        if isinstance(ans, (float, int)):
-            return {"answer": round(float(ans), 2)}
-        return {"answer": ans}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Code generation error: {str(e)}\nGenerated Code: {code}")
+def answer(req: Q):
+    prompt = PROMPT.format(cols=list(DF.columns),
+                           sample=DF.head(3).to_dict("records"),
+                           statuses=DF["status"].unique().tolist(),
+                           q=req.question)
+    messages = [{"role": "user", "content": prompt}]
+    for _ in range(2):
+        code = ""
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini", messages=messages,
+                temperature=0, timeout=6)
+            code = resp.choices[0].message.content
+            return {"answer": run_code(code)}
+        except Exception as e:
+            messages += [{"role": "assistant", "content": code or "none"},
+                         {"role": "user", "content": f"That failed: {e}. Fix it. Output only code."}]
+    return {"answer": None}
