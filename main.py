@@ -6,10 +6,8 @@ import pytz
 import os
 from openai import OpenAI
 
-# 1. Initialize FastAPI app first
 app = FastAPI()
 
-# 2. Configure OpenAI client to use AI Pipe
 client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openai/v1"
@@ -21,35 +19,42 @@ class QuestionRequest(BaseModel):
     question: str
 
 def get_cleaned_data():
-    res = requests.get(EXPORT_URL)
-    data = res.json()
-    
-    df = pd.DataFrame(data if isinstance(data, list) else data.get("orders", []))
-    if df.empty:
+    try:
+        res = requests.get(EXPORT_URL, timeout=10)
+        data = res.json()
+        
+        df = pd.DataFrame(data if isinstance(data, list) else data.get("orders", []))
+        if df.empty:
+            return df
+
+        if "updated_at" in df.columns and "order_id" in df.columns:
+            df["updated_at"] = pd.to_datetime(df["updated_at"])
+            df = df.sort_values("updated_at").drop_duplicates(subset=["order_id"], keep="last")
+
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+
         return df
-
-    # Rule: Latest updated_at for an order_id is current
-    if "updated_at" in df.columns and "order_id" in df.columns:
-        df["updated_at"] = pd.to_datetime(df["updated_at"])
-        df = df.sort_values("updated_at").drop_duplicates(subset=["order_id"], keep="last")
-
-    # Rule: Business dates use Asia/Kolkata timezone
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-
-    return df
+    except Exception as e:
+        print(f"Data fetch error: {e}")
+        return pd.DataFrame()
 
 @app.post("/")
 def answer_question(req: QuestionRequest):
     df = get_cleaned_data()
-    
+    if df.empty:
+        raise HTTPException(status_code=500, detail="Failed to load ledger data.")
+
+    # Limit rows passed to AI to prevent token limit errors (e.g., max 500 rows)
+    df_sample = df.tail(500)
+
     prompt = f"""
     You are a financial data assistant for Acme Appliances.
     Here is the cleaned ledger data (as JSON records):
-    {df.to_json(orient='records')}
+    {df_sample.to_json(orient='records')}
 
     Rules:
-    - Only orders with status 'paid' count as revenue.
+    - Only orders with status 'paid' count as revenue/valid orders.
     - Business dates use Asia/Kolkata timezone.
     - Money must be in USD, correct to the cent.
     - Product names must match the API spelling.
@@ -59,16 +64,21 @@ def answer_question(req: QuestionRequest):
     Return ONLY the final answer (a plain number, exact text, or product name). No extra commentary.
     """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    ans = response.choices[0].message.content.strip()
-
     try:
-        if "." in ans:
-            return {"answer": float(ans)}
-        return {"answer": int(ans)}
-    except ValueError:
-        return {"answer": ans}
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        ans = response.choices[0].message.content.strip()
+
+        # Format numeric output correctly
+        try:
+            if "." in ans:
+                return {"answer": float(ans)}
+            return {"answer": int(ans)}
+        except ValueError:
+            return {"answer": ans}
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI processing error: {str(e)}")
